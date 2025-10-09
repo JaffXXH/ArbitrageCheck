@@ -1,0 +1,487 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from matplotlib import style
+
+# Use ggplot style for better appearance 
+style.use('ggplot')
+
+class SkewArbitragePopup:
+    def __init__(self, parent, skew_matrix, title="Arbitrage Checks"):
+        """
+        Initialize the arbitrage popup window
+        
+        Args:
+            parent: Parent tkinter window
+            skew_matrix: Dictionary with volatility skew data
+            title: Popup window title
+        """
+        self.parent = parent
+        self.skew_matrix = skew_matrix.copy()  # Work with copy to preserve original
+        self.original_matrix = skew_matrix.copy()  # Keep original for reset
+        
+        # Create popup window
+        self.popup = tk.Toplevel(parent)
+        self.popup.title(title)
+        self.popup.geometry("1400x900")
+        self.popup.configure(padx=10, pady=10)
+        
+        # Make it modal (optional)
+        self.popup.transient(parent)
+        self.popup.grab_set()
+        
+        # Center the popup relative to parent
+        self.center_popup()
+        
+        self.tenors = list(skew_matrix.keys())
+        self.strategies = ['VOL_ATM', 'V25_STR', 'V25_RR', 'V10_STR', 'V10_RR']
+        
+        # Create main frames
+        self.create_control_frame()
+        self.create_results_frame()
+        self.create_plot_frame()
+        
+        # Initialize with first analysis
+        self.run_arbitrage_checks()
+    
+    def center_popup(self):
+        """Center the popup relative to parent window"""
+        self.popup.update_idletasks()
+        parent_x = self.parent.winfo_x()
+        parent_y = self.parent.winfo_y()
+        parent_width = self.parent.winfo_width()
+        parent_height = self.parent.winfo_height()
+        
+        popup_width = self.popup.winfo_width()
+        popup_height = self.popup.winfo_height()
+        
+        x = parent_x + (parent_width - popup_width) // 2
+        y = parent_y + (parent_height - popup_height) // 2
+        
+        self.popup.geometry(f"+{x}+{y}")
+    
+    def create_control_frame(self):
+        """Create the control panel with input fields and check buttons"""
+        control_frame = ttk.LabelFrame(self.popup, text="Arbitrage Controls", padding="10")
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Input frame for manual testing
+        input_frame = ttk.Frame(control_frame)
+        input_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(input_frame, text="Test - Add/Modify Tenor:").grid(row=0, column=0, sticky=tk.W)
+        
+        # Tenor selection
+        ttk.Label(input_frame, text="Tenor:").grid(row=1, column=0, padx=(0, 5))
+        self.tenor_var = tk.StringVar(value=self.tenors[0] if self.tenors else "1M")
+        tenor_combo = ttk.Combobox(input_frame, textvariable=self.tenor_var, 
+                                 values=self.tenors, width=8, state="readonly")
+        tenor_combo.grid(row=1, column=1, padx=(0, 10))
+        tenor_combo.bind('<<ComboboxSelected>>', self.on_tenor_selected)
+        
+        # Strategy inputs
+        strategy_frame = ttk.Frame(input_frame)
+        strategy_frame.grid(row=1, column=2, columnspan=10, sticky=tk.W, padx=(10, 0))
+        
+        self.strategy_vars = {}
+        for i, strategy in enumerate(self.strategies):
+            ttk.Label(strategy_frame, text=f"{strategy}:").grid(row=0, column=i*2, padx=(10, 5))
+            var = tk.DoubleVar(value=0.1)
+            entry = ttk.Entry(strategy_frame, textvariable=var, width=8)
+            entry.grid(row=0, column=i*2+1, padx=(0, 10))
+            self.strategy_vars[strategy] = var
+        
+        # Buttons
+        button_frame = ttk.Frame(control_frame)
+        button_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(button_frame, text="Update Tenor", 
+                  command=self.update_tenor).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="Run All Checks", 
+                  command=self.run_arbitrage_checks).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="Reset to Original", 
+                  command=self.reset_matrix).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="Close", 
+                  command=self.popup.destroy).pack(side=tk.RIGHT)
+        
+        # Initialize with first tenor values
+        self.update_input_fields()
+    
+    def on_tenor_selected(self, event=None):
+        """Update input fields when tenor selection changes"""
+        self.update_input_fields()
+    
+    def update_input_fields(self):
+        """Update input fields with current tenor values"""
+        tenor = self.tenor_var.get()
+        if tenor in self.skew_matrix:
+            for strategy, var in self.strategy_vars.items():
+                if strategy in self.skew_matrix[tenor]:
+                    var.set(self.skew_matrix[tenor][strategy])
+    
+    def create_results_frame(self):
+        """Create the results display area"""
+        self.results_frame = ttk.LabelFrame(self.popup, text="Arbitrage Check Results", padding="10")
+        self.results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Create treeview for results
+        columns = ("Tenor", "Check Type", "Status", "Details")
+        self.results_tree = ttk.Treeview(self.results_frame, columns=columns, show="headings", height=12)
+        
+        # Define headings
+        for col in columns:
+            self.results_tree.heading(col, text=col)
+            self.results_tree.column(col, width=120)
+        
+        self.results_tree.column("Details", width=400)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(self.results_frame, orient=tk.VERTICAL, command=self.results_tree.yview)
+        self.results_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.results_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Bind click event
+        self.results_tree.bind("<Double-1>", self.on_result_select)
+    
+    def create_plot_frame(self):
+        """Create the dynamic plotting area"""
+        plot_frame = ttk.LabelFrame(self.popup, text="Skew Visualization - Double-click failed checks to plot", padding="10")
+        plot_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create matplotlib figure with subplots
+        self.fig = Figure(figsize=(12, 8), dpi=100)
+        self.ax1 = self.fig.add_subplot(221)  # Top-left: Skew structure
+        self.ax2 = self.fig.add_subplot(222)  # Top-right: Term structure
+        self.ax3 = self.fig.add_subplot(223)  # Bottom-left: Risk reversals
+        self.ax4 = self.fig.add_subplot(224)  # Bottom-right: Strangles
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, plot_frame)
+        self.canvas.draw()
+        
+        # Add navigation toolbar for interactivity 
+        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
+        toolbar.update()
+        
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    def update_tenor(self):
+        """Update a tenor with new values from input fields"""
+        tenor = self.tenor_var.get()
+        new_values = {}
+        
+        for strategy, var in self.strategy_vars.items():
+            try:
+                new_values[strategy] = var.get()
+            except tk.TclError:
+                messagebox.showerror("Input Error", f"Invalid value for {strategy}")
+                return
+        
+        self.skew_matrix[tenor] = new_values
+        self.run_arbitrage_checks()
+        messagebox.showinfo("Success", f"Tenor {tenor} updated successfully")
+    
+    def run_arbitrage_checks(self):
+        """Run comprehensive arbitrage checks on the skew matrix"""
+        # Clear previous results
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+        
+        self.failed_checks = []
+        
+        # Run various arbitrage checks
+        self.check_positive_volatility()
+        self.check_butterfly_arbitrage()
+        self.check_calendar_arbitrage()
+        self.check_vertical_arbitrage()
+        self.check_skew_symmetry()
+        self.check_rr_consistency()
+        
+        # Update overall status
+        total_checks = len(self.results_tree.get_children())
+        failed_count = len([check for check in self.failed_checks if check['status'] == 'FAIL'])
+        warning_count = len([check for check in self.failed_checks if check['status'] == 'WARNING'])
+        
+        status = "PASS" if failed_count == 0 else f"FAILED ({failed_count} issues)"
+        
+        self.results_tree.insert("", 0, values=("OVERALL", "All Checks", status, 
+                                              f"{total_checks} checks, {failed_count} failed, {warning_count} warnings"))
+    
+    def check_positive_volatility(self):
+        """Check that all volatilities are positive"""
+        for tenor, strategies in self.skew_matrix.items():
+            for strategy, value in strategies.items():
+                if 'VOL' in strategy and value <= 0:
+                    status = "FAIL"
+                    details = f"Non-positive volatility: {value:.4f}"
+                    self.record_failed_check(tenor, "Positive Volatility", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(tenor, "Positive Volatility", "PASS", ""))
+    
+    def check_butterfly_arbitrage(self):
+        """Check for butterfly arbitrage in risk reversals and strangles"""
+        for tenor, strategies in self.skew_matrix.items():
+            # Butterfly check: V25_STR should be greater than ATM vol
+            if 'V25_STR' in strategies and 'VOL_ATM' in strategies:
+                if strategies['V25_STR'] <= strategies['VOL_ATM']:
+                    status = "FAIL"
+                    details = f"V25_STR ({strategies['V25_STR']:.4f}) <= ATM ({strategies['VOL_ATM']:.4f})"
+                    self.record_failed_check(tenor, "Butterfly Arbitrage", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(tenor, "Butterfly Arbitrage", "PASS", ""))
+    
+    def check_calendar_arbitrage(self):
+        """Check for calendar arbitrage in term structure using total variance"""
+        tenors_ordered = self.get_tenors_in_order()
+        
+        for i in range(1, len(tenors_ordered)):
+            current_tenor = tenors_ordered[i]
+            prev_tenor = tenors_ordered[i-1]
+            
+            if (current_tenor in self.skew_matrix and prev_tenor in self.skew_matrix and
+                'VOL_ATM' in self.skew_matrix[current_tenor] and 'VOL_ATM' in self.skew_matrix[prev_tenor]):
+                
+                current_var = self.calculate_total_variance(current_tenor, 'VOL_ATM')
+                prev_var = self.calculate_total_variance(prev_tenor, 'VOL_ATM')
+                
+                if current_var < prev_var:
+                    status = "FAIL"
+                    details = f"Total variance decreases: {current_var:.6f} < {prev_var:.6f}"
+                    self.record_failed_check(current_tenor, "Calendar Arbitrage", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(current_tenor, "Calendar Arbitrage", "PASS", ""))
+    
+    def check_vertical_arbitrage(self):
+        """Check vertical arbitrage conditions in volatility smile"""
+        for tenor, strategies in self.skew_matrix.items():
+            if all(s in strategies for s in ['V10_STR', 'V25_STR', 'VOL_ATM']):
+                v10_str = strategies['V10_STR']
+                v25_str = strategies['V25_STR']
+                atm = strategies['VOL_ATM']
+                
+                # V10_STR should be >= V25_STR >= ATM
+                issues = []
+                if v10_str < v25_str:
+                    issues.append(f"V10_STR ({v10_str:.4f}) < V25_STR ({v25_str:.4f})")
+                if v25_str < atm:
+                    issues.append(f"V25_STR ({v25_str:.4f}) < ATM ({atm:.4f})")
+                
+                if issues:
+                    status = "FAIL"
+                    details = "; ".join(issues)
+                    self.record_failed_check(tenor, "Vertical Arbitrage", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(tenor, "Vertical Arbitrage", "PASS", ""))
+    
+    def check_skew_symmetry(self):
+        """Check symmetry properties of risk reversals"""
+        for tenor, strategies in self.skew_matrix.items():
+            if 'V25_RR' in strategies:
+                rr_value = strategies['V25_RR']
+                # Risk reversal should be within reasonable bounds
+                if abs(rr_value) > 0.1:  # More realistic threshold for FX
+                    status = "WARNING"
+                    details = f"Large risk reversal: {rr_value:.4f}"
+                    self.record_failed_check(tenor, "Skew Symmetry", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(tenor, "Skew Symmetry", "PASS", ""))
+    
+    def check_rr_consistency(self):
+        """Check consistency between 10D and 25D risk reversals"""
+        for tenor, strategies in self.skew_matrix.items():
+            if all(rr in strategies for rr in ['V10_RR', 'V25_RR']):
+                v10_rr = strategies['V10_RR']
+                v25_rr = strategies['V25_RR']
+                
+                # V10_RR should typically be larger in magnitude than V25_RR
+                if abs(v10_rr) < abs(v25_rr):
+                    status = "WARNING"
+                    details = f"V10_RR ({v10_rr:.4f}) smaller than V25_RR ({v25_rr:.4f}) in magnitude"
+                    self.record_failed_check(tenor, "RR Consistency", status, details)
+                else:
+                    self.results_tree.insert("", "end", values=(tenor, "RR Consistency", "PASS", ""))
+    
+    def record_failed_check(self, tenor, check_type, status, details):
+        """Record a failed check and add to treeview"""
+        self.results_tree.insert("", "end", values=(tenor, check_type, status, details))
+        self.failed_checks.append({
+            'tenor': tenor,
+            'check_type': check_type,
+            'status': status,
+            'details': details
+        })
+    
+    def on_result_select(self, event):
+        """Handle double-click on result item to plot the skew"""
+        selection = self.results_tree.selection()
+        if not selection:
+            return
+            
+        item = selection[0]
+        values = self.results_tree.item(item, 'values')
+        
+        if len(values) < 4:
+            return
+            
+        tenor = values[0]
+        check_type = values[1]
+        status = values[2]
+        
+        if status in ["FAIL", "WARNING"] and tenor in self.skew_matrix:
+            self.plot_comprehensive_analysis(tenor, check_type, status)
+    
+    def plot_comprehensive_analysis(self, tenor, check_type, status):
+        """Plot comprehensive analysis for a specific tenor"""
+        # Clear all subplots
+        for ax in [self.ax1, self.ax2, self.ax3, self.ax4]:
+            ax.clear()
+        
+        strategies = self.skew_matrix[tenor]
+        
+        # Plot 1: Skew structure for the specific tenor
+        skew_points = ['V10_STR', 'V25_STR', 'VOL_ATM']
+        x_positions = [0, 1, 2]
+        values = [strategies.get(s, 0) for s in skew_points]
+        
+        colors = ['red' if status == 'FAIL' else 'orange', 'blue', 'green']
+        self.ax1.bar(x_positions, values, color=colors, alpha=0.7)
+        self.ax1.set_xticks(x_positions)
+        self.ax1.set_xticklabels(skew_points)
+        self.ax1.set_title(f'Skew Structure - {tenor}\n({check_type}: {status})')
+        self.ax1.set_ylabel('Volatility')
+        self.ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Term structure with highlighted tenor
+        tenors_ordered = self.get_tenors_in_order()
+        atm_vols = [self.skew_matrix[t].get('VOL_ATM', 0) for t in tenors_ordered]
+        
+        self.ax2.plot(tenors_ordered, atm_vols, 'bo-', linewidth=2, markersize=6, label='ATM Volatility')
+        
+        # Highlight the problematic tenor
+        if tenor in tenors_ordered:
+            tenor_idx = tenors_ordered.index(tenor)
+            self.ax2.plot(tenor, atm_vols[tenor_idx], 'ro', markersize=10, 
+                         label=f'Issue: {check_type}')
+        
+        self.ax2.set_title('Term Structure (ATM Volatilities)')
+        self.ax2.set_ylabel('ATM Volatility')
+        self.ax2.grid(True, alpha=0.3)
+        self.ax2.legend()
+        self.ax2.tick_params(axis='x', rotation=45)
+        
+        # Plot 3: Risk reversals across tenors
+        rr_25 = [self.skew_matrix[t].get('V25_RR', 0) for t in tenors_ordered]
+        rr_10 = [self.skew_matrix[t].get('V10_RR', 0) for t in tenors_ordered]
+        
+        self.ax3.plot(tenors_ordered, rr_25, 's-', linewidth=2, markersize=6, label='25D RR')
+        self.ax3.plot(tenors_ordered, rr_10, '^-', linewidth=2, markersize=6, label='10D RR')
+        
+        if tenor in tenors_ordered:
+            tenor_idx = tenors_ordered.index(tenor)
+            self.ax3.plot(tenor, rr_25[tenor_idx], 'ro', markersize=8)
+        
+        self.ax3.set_title('Risk Reversal Term Structure')
+        self.ax3.set_ylabel('Risk Reversal')
+        self.ax3.grid(True, alpha=0.3)
+        self.ax3.legend()
+        self.ax3.tick_params(axis='x', rotation=45)
+        
+        # Plot 4: Strangles across tenors
+        str_25 = [self.skew_matrix[t].get('V25_STR', 0) for t in tenors_ordered]
+        str_10 = [self.skew_matrix[t].get('V10_STR', 0) for t in tenors_ordered]
+        
+        self.ax4.plot(tenors_ordered, str_25, 's-', linewidth=2, markersize=6, label='25D Strangle')
+        self.ax4.plot(tenors_ordered, str_10, '^-', linewidth=2, markersize=6, label='10D Strangle')
+        
+        if tenor in tenors_ordered:
+            tenor_idx = tenors_ordered.index(tenor)
+            self.ax4.plot(tenor, str_25[tenor_idx], 'ro', markersize=8)
+        
+        self.ax4.set_title('Strangle Term Structure')
+        self.ax4.set_ylabel('Strangle Volatility')
+        self.ax4.grid(True, alpha=0.3)
+        self.ax4.legend()
+        self.ax4.tick_params(axis='x', rotation=45)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def calculate_total_variance(self, tenor, strategy):
+        """Calculate total variance for a given tenor and strategy"""
+        if tenor in self.skew_matrix and strategy in self.skew_matrix[tenor]:
+            vol = self.skew_matrix[tenor][strategy]
+            time_years = self.tenor_to_days(tenor) / 365.0
+            return vol ** 2 * time_years
+        return 0.0
+    
+    def get_tenors_in_order(self):
+        """Return tenors in temporal order"""
+        tenor_order = {'1D': 1, '2D': 2, '3D': 3, '1W': 7, '2W': 14, '3W': 21, 
+                      '1M': 30, '3M': 90, '6M': 180, '1Y': 365}
+        return sorted(self.tenors, key=lambda x: tenor_order.get(x, 0))
+    
+    def tenor_to_days(self, tenor):
+        """Convert tenor string to days"""
+        tenor_map = {'1D': 1, '2D': 2, '3D': 3, '1W': 7, '2W': 14, '3W': 21, 
+                    '1M': 30, '3M': 90, '6M': 180, '1Y': 365}
+        return tenor_map.get(tenor, 30)
+    
+    def reset_matrix(self):
+        """Reset to original matrix"""
+        self.skew_matrix = self.original_matrix.copy()
+        self.update_input_fields()
+        self.run_arbitrage_checks()
+        messagebox.showinfo("Reset", "Skew matrix reset to original values")
+
+# Example usage function for your existing app
+def open_arbitrage_popup(parent_app, skew_matrix):
+    """
+    Call this function from your existing Tkinter app to open the arbitrage analyzer popup
+    
+    Args:
+        parent_app: Your main Tkinter window (usually 'root' or 'self')
+        skew_matrix: Your volatility skew matrix dictionary
+    """
+    popup = SkewArbitragePopup(parent_app, skew_matrix)
+
+# Example of how to integrate with your existing app:
+class YourExistingApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Your Existing App")
+        self.root.geometry("800x600")
+        
+        # Your existing app content here...
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="Your Existing Application", 
+                 font=('Arial', 16)).pack(pady=20)
+        
+        # Example button to open the arbitrage analyzer
+        ttk.Button(main_frame, text="Analyze Skew Arbitrage", 
+                  command=self.open_analyzer).pack(pady=10)
+        
+        # Sample skew matrix
+        self.sample_skew_matrix = {
+            '1D': {'VOL_ATM': 0.075, 'V25_STR': 0.0916, 'V25_RR': -0.0048, 'V10_STR': 0.097, 'V10_RR': 0.0008},
+            '1W': {'VOL_ATM': 0.08, 'V25_STR': 0.1017, 'V25_RR': 0.002, 'V10_STR': 0.1132, 'V10_RR': -0.0046},
+            '1M': {'VOL_ATM': 0.085, 'V25_STR': 0.0979, 'V25_RR': 0.0019, 'V10_STR': 0.1171, 'V10_RR': 0.0018},
+            '3M': {'VOL_ATM': 0.09, 'V25_STR': 0.1014, 'V25_RR': 0.0022, 'V10_STR': 0.1249, 'V10_RR': 0.0099},
+            '6M': {'VOL_ATM': 0.095, 'V25_STR': 0.11, 'V25_RR': 0.0009, 'V10_STR': 0.1251, 'V10_RR': -0.0},
+            '1Y': {'VOL_ATM': 0.1, 'V25_STR': 0.1175, 'V25_RR': -0.0027, 'V10_STR': 0.1232, 'V10_RR': 0.002}
+        }
+    
+    def open_analyzer(self):
+        """Open the arbitrage analyzer popup"""
+        open_arbitrage_popup(self.root, self.sample_skew_matrix)
+
+if __name__ == "__main__":
+    # Test the popup integration
+    root = tk.Tk()
+    app = YourExistingApp(root)
+    root.mainloop()
