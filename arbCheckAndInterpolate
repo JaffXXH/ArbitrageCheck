@@ -1,0 +1,239 @@
+import math
+from typing import Dict, List, Tuple
+import numpy as np
+
+# ---------- Tenor parsing ----------
+_DAY_COUNT = 365.0
+
+def tenor_to_years(tenor: str) -> float:
+    """Convert tenor strings (e.g., '1D','2W','3M','1Y') to year fractions."""
+    t = tenor.upper().strip()
+    if t.endswith('D'):
+        return float(t[:-1]) / _DAY_COUNT
+    if t.endswith('W'):
+        return float(t[:-1]) * 7.0 / _DAY_COUNT
+    if t.endswith('M'):
+        # Simple ACT/365 approximation: 30d per month
+        return float(t[:-1]) * 30.0 / _DAY_COUNT
+    if t.endswith('Y'):
+        return float(t[:-1])
+    raise ValueError(f"Unknown tenor format: {tenor}")
+
+# ---------- Monotone piecewise cubic Hermite for scalar sequences ----------
+def pchip_monotone(x: np.ndarray, y: np.ndarray):
+    """
+    Minimal monotone shape-preserving interpolator (PCHIP-like).
+    Returns a callable f(xq) for xq within [min(x), max(x)].
+    """
+    # Ensure increasing x
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    n = len(x)
+
+    # Slopes of secants
+    dx = np.diff(x)
+    dy = np.diff(y)
+    m = dy / dx  # secant slopes
+
+    # Endpoint derivatives (Fritsch-Carlson)
+    d = np.zeros(n)
+    d[0] = m[0]
+    d[-1] = m[-1]
+    for i in range(1, n-1):
+        if m[i-1] * m[i] <= 0:
+            d[i] = 0.0
+        else:
+            w1 = 2*dx[i] + dx[i-1]
+            w2 = dx[i] + 2*dx[i-1]
+            d[i] = (w1 + w2) / (w1/m[i-1] + w2/m[i])
+
+    def eval(xq: np.ndarray) -> np.ndarray:
+        xq = np.asarray(xq)
+        out = np.empty_like(xq, dtype=float)
+        for idx, z in enumerate(xq):
+            if z <= x[0]:
+                # Clamp to boundary (no extrapolation instability)
+                out[idx] = y[0]
+                continue
+            if z >= x[-1]:
+                out[idx] = y[-1]
+                continue
+            # Locate interval j with x[j] <= z < x[j+1]
+            j = np.searchsorted(x, z) - 1
+            h = x[j+1] - x[j]
+            t = (z - x[j]) / h
+            h00 = (1 + 2*t) * (1 - t) ** 2
+            h10 = t * (1 - t) ** 2
+            h01 = t**2 * (3 - 2*t)
+            h11 = t**2 * (t - 1)
+            out[idx] = (h00 * y[j] + h10 * h * d[j] +
+                        h01 * y[j+1] + h11 * h * d[j+1])
+        return out
+
+    return eval
+
+# ---------- Parametric time dynamics for RR/STR ----------
+def fit_saturating(xT: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Fit y(T) ~ a + b*(1 - exp(-lambda*T)) using least squares on a grid of lambdas.
+    Returns (a, b, lambda). If insufficient points, falls back to simple linear in sqrt(T).
+    """
+    xT = np.asarray(xT, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(xT) < 3:
+        # Fallback: linear in sqrt(T)
+        s = np.sqrt(np.maximum(xT, 1e-8))
+        A = np.vstack([np.ones_like(s), s]).T
+        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        # Encode fallback as lambda=0 and b on sqrt(T)
+        return coef[0], coef[1], 0.0
+
+    lambdas = np.logspace(-2, 1, 60)  # broad grid: 0.01 to 10
+    best = None
+    for lam in lambdas:
+        g = 1.0 - np.exp(-lam * xT)
+        A = np.vstack([np.ones_like(g), g]).T  # columns: [a, b*g]
+        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b = coef
+        resid = y - (a + b * g)
+        rss = float(resid @ resid)
+        if (best is None) or (rss < best[0]):
+            best = (rss, a, b, lam)
+    _, a, b, lam = best
+    return a, b, lam
+
+def eval_saturating(T: float, a: float, b: float, lam: float, fallback_linear_sqrt: bool = False):
+    if lam == 0.0 and fallback_linear_sqrt:
+        return a + b * math.sqrt(max(T, 1e-8))
+    return a + b * (1.0 - math.exp(-lam * T))
+
+# ---------- Arbitrage checks ----------
+def check_calendar_no_arbitrage(Ts: List[float], W: List[float]) -> bool:
+    """Ensure total variance W(T) is non-decreasing in T."""
+    for i in range(1, len(Ts)):
+        if W[i] + 1e-12 < W[i-1]:
+            return False
+    return True
+
+def clamp_monotone(W: np.ndarray) -> np.ndarray:
+    """Make W non-decreasing by isotonic adjustment if necessary."""
+    # Simple isotonic projection via cumulative maximum
+    return np.maximum.accumulate(W)
+
+# ---------- Interpolation driver ----------
+METRICS = ["VOL_ATM", "V25_STR", "V25_RR", "V10_STR", "V10_RR"]
+
+def interpolate_through_tenors(
+    main_matrix: Dict[str, Dict[str, float]],
+    partial_matrix: Dict[str, Dict[str, float]]
+) -> Dict[str, Dict[str, float]]:
+    """
+    Given a full main_matrix for a single ccy_pair and a partial_matrix (same structure),
+    return a completed matrix with all tenors in main_matrix, filling missing tenors
+    via robust time interpolation:
+      - VOL_ATM via monotone PCHIP on total variance W(T)
+      - STR/RR via saturating time dynamics (fallback linear in sqrt(T) if sparse)
+    """
+    # 1) Prepare tenor grid
+    all_tenors = list(main_matrix.keys())
+    Ts_all = np.array([tenor_to_years(t) for t in all_tenors], dtype=float)
+
+    # 2) Collect observed points from partial_matrix
+    observed_tenors = [t for t in partial_matrix.keys() if t in main_matrix]
+    if not observed_tenors:
+        # If no points, return main_matrix (or zeros) — here use main as prior
+        return {t: dict(main_matrix[t]) for t in all_tenors}
+
+    Ts_obs = np.array([tenor_to_years(t) for t in observed_tenors], dtype=float)
+
+    # Build output initialized from partial or main as prior
+    out = {t: {m: partial_matrix.get(t, {}).get(m, main_matrix[t][m]) for m in METRICS} for t in all_tenors}
+
+    # 3) VOL_ATM: interpolate in total variance
+    W_obs = np.array([
+        (partial_matrix[ten]["VOL_ATM"] if "VOL_ATM" in partial_matrix.get(ten, {})
+         else main_matrix[ten]["VOL_ATM"])**2 * tenor_to_years(ten)
+        for ten in observed_tenors
+    ], dtype=float)
+
+    # Fit a monotone PCHIP on (Ts_obs, W_obs)
+    pchip_W = pchip_monotone(Ts_obs, W_obs)
+    W_all = pchip_W(Ts_all)
+
+    # Enforce monotonicity if numerical issues arise
+    if not check_calendar_no_arbitrage(list(Ts_all), list(W_all)):
+        W_all = clamp_monotone(W_all)
+
+    # Recover ATM vol at all tenors
+    for i, t in enumerate(all_tenors):
+        T = Ts_all[i]
+        if T <= 0:
+            out[t]["VOL_ATM"] = out[t].get("VOL_ATM", main_matrix[t]["VOL_ATM"])
+        else:
+            out[t]["VOL_ATM"] = math.sqrt(max(W_all[i], 0.0) / T)
+
+    # 4) V25_RR, V10_RR: saturating model
+    for rr_key in ["V25_RR", "V10_RR"]:
+        y_obs = np.array([
+            (partial_matrix[ten][rr_key] if rr_key in partial_matrix.get(ten, {})
+             else main_matrix[ten][rr_key]) for ten in observed_tenors
+        ], dtype=float)
+        a, b, lam = fit_saturating(Ts_obs, y_obs)
+        for i, t in enumerate(all_tenors):
+            T = Ts_all[i]
+            out[t][rr_key] = eval_saturating(T, a, b, lam, fallback_linear_sqrt=(lam == 0.0))
+
+    # 5) V25_STR, V10_STR: saturating model (or power law if preferred)
+    for str_key in ["V25_STR", "V10_STR"]:
+        y_obs = np.array([
+            (partial_matrix[ten][str_key] if str_key in partial_matrix.get(ten, {})
+             else main_matrix[ten][str_key]) for ten in observed_tenors
+        ], dtype=float)
+        a, b, lam = fit_saturating(Ts_obs, y_obs)
+        for i, t in enumerate(all_tenors):
+            T = Ts_all[i]
+            out[t][str_key] = eval_saturating(T, a, b, lam, fallback_linear_sqrt=(lam == 0.0))
+
+    # 6) Optional guardrails: keep STR >= 0 and reasonable vs ATM
+    for t in all_tenors:
+        atm = out[t]["VOL_ATM"]
+        # Soft clamps: prevent pathological negative butterflies
+        out[t]["V25_STR"] = max(0.0, out[t]["V25_STR"])
+        out[t]["V10_STR"] = max(0.0, out[t]["V10_STR"])
+        # Keep STR not exploding relative to ATM
+        for k in ["V25_STR", "V10_STR"]:
+            out[t][k] = min(out[t][k], 2.0 * atm)
+
+    return out
+
+# ---------- Matrix update ----------#
+from copy import deepcopy
+
+def update_matrix(main_matrix, last_matrix, new_matrix):
+    """
+    Update main_matrix in place by adding the difference between new_matrix and last_matrix.
+    Structure: {ccy_pair: {tenor: {metric: value}}}
+    
+    main_matrix[ccy][tenor][metric] += (new_matrix[ccy][tenor][metric] - last_matrix[ccy][tenor][metric])
+    """
+    # Copy to preserve original
+    updated = deepcopy(main_matrix)
+
+    for tenor, metrics in new_matrix.items():
+        if tenor not in last_matrix:
+            continue
+        if tenor not in updated:
+            updated[tenor] = {}
+
+        for metric, new_val in metrics.items():
+            if metric not in last_matrix[tenor]:
+                continue
+            last_val = last_matrix[tenor][metric]
+            # main_val = updated[tenor].get(metric, 0.0)
+            
+            delta = new_val - last_val
+            updated[tenor][metric] += delta
+
+    return updated
