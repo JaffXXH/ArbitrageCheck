@@ -1,239 +1,303 @@
-import math
-from typing import Dict, List, Tuple
 import numpy as np
+import matplotlib.pyplot as plt
+from scipy import interpolate
+from scipy.stats import norm
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import warnings
 
-# ---------- Tenor parsing ----------
-_DAY_COUNT = 365.0
-
-def tenor_to_years(tenor: str) -> float:
-    """Convert tenor strings (e.g., '1D','2W','3M','1Y') to year fractions."""
-    t = tenor.upper().strip()
-    if t.endswith('D'):
-        return float(t[:-1]) / _DAY_COUNT
-    if t.endswith('W'):
-        return float(t[:-1]) * 7.0 / _DAY_COUNT
-    if t.endswith('M'):
-        # Simple ACT/365 approximation: 30d per month
-        return float(t[:-1]) * 30.0 / _DAY_COUNT
-    if t.endswith('Y'):
-        return float(t[:-1])
-    raise ValueError(f"Unknown tenor format: {tenor}")
-
-# ---------- Monotone piecewise cubic Hermite for scalar sequences ----------
-def pchip_monotone(x: np.ndarray, y: np.ndarray):
+@dataclass
+class FXVolSurface:
     """
-    Minimal monotone shape-preserving interpolator (PCHIP-like).
-    Returns a callable f(xq) for xq within [min(x), max(x)].
+    A class to represent an FX Implied Volatility Surface and check for static arbitrage.
+    Delta convention: Spot delta (non-premium adjusted) :cite[1]
     """
-    # Ensure increasing x
-    order = np.argsort(x)
-    x = x[order]
-    y = y[order]
-    n = len(x)
+    times_to_maturity: np.ndarray
+    delta_grid: np.ndarray
+    implied_vols: np.ndarray
+    spot: float
+    domestic_rate: float
+    foreign_rate: float
 
-    # Slopes of secants
-    dx = np.diff(x)
-    dy = np.diff(y)
-    m = dy / dx  # secant slopes
+    def __post_init__(self):
+        self.strike_grid = self._calculate_strike_from_delta()
+        self.call_prices = self._calculate_call_prices()
+        self.arbitrage_violations = {
+            'butterfly': [],
+            'calendar': [],
+            'vertical': []
+        }
 
-    # Endpoint derivatives (Fritsch-Carlson)
-    d = np.zeros(n)
-    d[0] = m[0]
-    d[-1] = m[-1]
-    for i in range(1, n-1):
-        if m[i-1] * m[i] <= 0:
-            d[i] = 0.0
-        else:
-            w1 = 2*dx[i] + dx[i-1]
-            w2 = dx[i] + 2*dx[i-1]
-            d[i] = (w1 + w2) / (w1/m[i-1] + w2/m[i])
+    def _calculate_strike_from_delta(self) -> np.ndarray:
+        """Convert delta to strike price using Black-Scholes-Garman-Kohlhagen formula"""
+        strikes = np.zeros_like(self.implied_vols)
+        for i, T in enumerate(self.times_to_maturity):
+            for j, delta in enumerate(self.delta_grid):
+                vol = self.implied_vols[i, j]
+                # Solve for strike that gives target delta
+                strike_guess = self.spot * np.exp(
+                    -norm.ppf(abs(delta)) * vol * np.sqrt(T) +
+                    (self.domestic_rate - self.foreign_rate + 0.5 * vol**2) * T
+                )
+                strikes[i, j] = strike_guess
+        return strikes
 
-    def eval(xq: np.ndarray) -> np.ndarray:
-        xq = np.asarray(xq)
-        out = np.empty_like(xq, dtype=float)
-        for idx, z in enumerate(xq):
-            if z <= x[0]:
-                # Clamp to boundary (no extrapolation instability)
-                out[idx] = y[0]
-                continue
-            if z >= x[-1]:
-                out[idx] = y[-1]
-                continue
-            # Locate interval j with x[j] <= z < x[j+1]
-            j = np.searchsorted(x, z) - 1
-            h = x[j+1] - x[j]
-            t = (z - x[j]) / h
-            h00 = (1 + 2*t) * (1 - t) ** 2
-            h10 = t * (1 - t) ** 2
-            h01 = t**2 * (3 - 2*t)
-            h11 = t**2 * (t - 1)
-            out[idx] = (h00 * y[j] + h10 * h * d[j] +
-                        h01 * y[j+1] + h11 * h * d[j+1])
-        return out
-
-    return eval
-
-# ---------- Parametric time dynamics for RR/STR ----------
-def fit_saturating(xT: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Fit y(T) ~ a + b*(1 - exp(-lambda*T)) using least squares on a grid of lambdas.
-    Returns (a, b, lambda). If insufficient points, falls back to simple linear in sqrt(T).
-    """
-    xT = np.asarray(xT, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    if len(xT) < 3:
-        # Fallback: linear in sqrt(T)
-        s = np.sqrt(np.maximum(xT, 1e-8))
-        A = np.vstack([np.ones_like(s), s]).T
-        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        # Encode fallback as lambda=0 and b on sqrt(T)
-        return coef[0], coef[1], 0.0
-
-    lambdas = np.logspace(-2, 1, 60)  # broad grid: 0.01 to 10
-    best = None
-    for lam in lambdas:
-        g = 1.0 - np.exp(-lam * xT)
-        A = np.vstack([np.ones_like(g), g]).T  # columns: [a, b*g]
-        coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        a, b = coef
-        resid = y - (a + b * g)
-        rss = float(resid @ resid)
-        if (best is None) or (rss < best[0]):
-            best = (rss, a, b, lam)
-    _, a, b, lam = best
-    return a, b, lam
-
-def eval_saturating(T: float, a: float, b: float, lam: float, fallback_linear_sqrt: bool = False):
-    if lam == 0.0 and fallback_linear_sqrt:
-        return a + b * math.sqrt(max(T, 1e-8))
-    return a + b * (1.0 - math.exp(-lam * T))
-
-# ---------- Arbitrage checks ----------
-def check_calendar_no_arbitrage(Ts: List[float], W: List[float]) -> bool:
-    """Ensure total variance W(T) is non-decreasing in T."""
-    for i in range(1, len(Ts)):
-        if W[i] + 1e-12 < W[i-1]:
-            return False
-    return True
-
-def clamp_monotone(W: np.ndarray) -> np.ndarray:
-    """Make W non-decreasing by isotonic adjustment if necessary."""
-    # Simple isotonic projection via cumulative maximum
-    return np.maximum.accumulate(W)
-
-# ---------- Interpolation driver ----------
-METRICS = ["VOL_ATM", "V25_STR", "V25_RR", "V10_STR", "V10_RR"]
-
-def interpolate_through_tenors(
-    main_matrix: Dict[str, Dict[str, float]],
-    partial_matrix: Dict[str, Dict[str, float]]
-) -> Dict[str, Dict[str, float]]:
-    """
-    Given a full main_matrix for a single ccy_pair and a partial_matrix (same structure),
-    return a completed matrix with all tenors in main_matrix, filling missing tenors
-    via robust time interpolation:
-      - VOL_ATM via monotone PCHIP on total variance W(T)
-      - STR/RR via saturating time dynamics (fallback linear in sqrt(T) if sparse)
-    """
-    # 1) Prepare tenor grid
-    all_tenors = list(main_matrix.keys())
-    Ts_all = np.array([tenor_to_years(t) for t in all_tenors], dtype=float)
-
-    # 2) Collect observed points from partial_matrix
-    observed_tenors = [t for t in partial_matrix.keys() if t in main_matrix]
-    if not observed_tenors:
-        # If no points, return main_matrix (or zeros) — here use main as prior
-        return {t: dict(main_matrix[t]) for t in all_tenors}
-
-    Ts_obs = np.array([tenor_to_years(t) for t in observed_tenors], dtype=float)
-
-    # Build output initialized from partial or main as prior
-    out = {t: {m: partial_matrix.get(t, {}).get(m, main_matrix[t][m]) for m in METRICS} for t in all_tenors}
-
-    # 3) VOL_ATM: interpolate in total variance
-    W_obs = np.array([
-        (partial_matrix[ten]["VOL_ATM"] if "VOL_ATM" in partial_matrix.get(ten, {})
-         else main_matrix[ten]["VOL_ATM"])**2 * tenor_to_years(ten)
-        for ten in observed_tenors
-    ], dtype=float)
-
-    # Fit a monotone PCHIP on (Ts_obs, W_obs)
-    pchip_W = pchip_monotone(Ts_obs, W_obs)
-    W_all = pchip_W(Ts_all)
-
-    # Enforce monotonicity if numerical issues arise
-    if not check_calendar_no_arbitrage(list(Ts_all), list(W_all)):
-        W_all = clamp_monotone(W_all)
-
-    # Recover ATM vol at all tenors
-    for i, t in enumerate(all_tenors):
-        T = Ts_all[i]
+    def calculate_call_price(self, K: float, T: float, sigma: float) -> float:
+        """Black-Scholes-Garman-Kohlhagen formula for FX call options :cite[1]"""
         if T <= 0:
-            out[t]["VOL_ATM"] = out[t].get("VOL_ATM", main_matrix[t]["VOL_ATM"])
-        else:
-            out[t]["VOL_ATM"] = math.sqrt(max(W_all[i], 0.0) / T)
+            return max(self.spot - K, 0)
+        
+        F = self.spot * np.exp((self.domestic_rate - self.foreign_rate) * T)
+        d1 = (np.log(F / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        
+        call_price = np.exp(-self.domestic_rate * T) * (F * norm.cdf(d1) - K * norm.cdf(d2))
+        return max(call_price, 0)  # Ensure non-negativity
 
-    # 4) V25_RR, V10_RR: saturating model
-    for rr_key in ["V25_RR", "V10_RR"]:
-        y_obs = np.array([
-            (partial_matrix[ten][rr_key] if rr_key in partial_matrix.get(ten, {})
-             else main_matrix[ten][rr_key]) for ten in observed_tenors
-        ], dtype=float)
-        a, b, lam = fit_saturating(Ts_obs, y_obs)
-        for i, t in enumerate(all_tenors):
-            T = Ts_all[i]
-            out[t][rr_key] = eval_saturating(T, a, b, lam, fallback_linear_sqrt=(lam == 0.0))
+    def _calculate_call_prices(self) -> np.ndarray:
+        """Calculate call prices from implied volatilities"""
+        call_prices = np.zeros_like(self.implied_vols)
+        for i, T in enumerate(self.times_to_maturity):
+            for j, K in enumerate(self.strike_grid[i]):
+                sigma = self.implied_vols[i, j]
+                call_prices[i, j] = self.calculate_call_price(K, T, sigma)
+        return call_prices
 
-    # 5) V25_STR, V10_STR: saturating model (or power law if preferred)
-    for str_key in ["V25_STR", "V10_STR"]:
-        y_obs = np.array([
-            (partial_matrix[ten][str_key] if str_key in partial_matrix.get(ten, {})
-             else main_matrix[ten][str_key]) for ten in observed_tenors
-        ], dtype=float)
-        a, b, lam = fit_saturating(Ts_obs, y_obs)
-        for i, t in enumerate(all_tenors):
-            T = Ts_all[i]
-            out[t][str_key] = eval_saturating(T, a, b, lam, fallback_linear_sqrt=(lam == 0.0))
-
-    # 6) Optional guardrails: keep STR >= 0 and reasonable vs ATM
-    for t in all_tenors:
-        atm = out[t]["VOL_ATM"]
-        # Soft clamps: prevent pathological negative butterflies
-        out[t]["V25_STR"] = max(0.0, out[t]["V25_STR"])
-        out[t]["V10_STR"] = max(0.0, out[t]["V10_STR"])
-        # Keep STR not exploding relative to ATM
-        for k in ["V25_STR", "V10_STR"]:
-            out[t][k] = min(out[t][k], 2.0 * atm)
-
-    return out
-
-# ---------- Matrix update ----------#
-from copy import deepcopy
-
-def update_matrix(main_matrix, last_matrix, new_matrix):
-    """
-    Update main_matrix in place by adding the difference between new_matrix and last_matrix.
-    Structure: {ccy_pair: {tenor: {metric: value}}}
-    
-    main_matrix[ccy][tenor][metric] += (new_matrix[ccy][tenor][metric] - last_matrix[ccy][tenor][metric])
-    """
-    # Copy to preserve original
-    updated = deepcopy(main_matrix)
-
-    for tenor, metrics in new_matrix.items():
-        if tenor not in last_matrix:
-            continue
-        if tenor not in updated:
-            updated[tenor] = {}
-
-        for metric, new_val in metrics.items():
-            if metric not in last_matrix[tenor]:
+    def check_butterfly_arbitrage(self, tolerance: float = 1e-5) -> bool:
+        """
+        Check for butterfly arbitrage (positive density condition)
+        Proposition: The second derivative of call price wrt strike must be non-negative
+        d²C/dK² ≥ 0 for all K > 0 :cite[1]
+        """
+        arbitrage_free = True
+        for i, T in enumerate(self.times_to_maturity):
+            if T <= 0:
                 continue
-            last_val = last_matrix[tenor][metric]
-            # main_val = updated[tenor].get(metric, 0.0)
+                
+            strikes = self.strike_grid[i]
+            call_prices = self.call_prices[i]
             
-            delta = new_val - last_val
-            updated[tenor][metric] += delta
+            # Sort by strike
+            sort_idx = np.argsort(strikes)
+            strikes_sorted = strikes[sort_idx]
+            calls_sorted = call_prices[sort_idx]
+            
+            # Calculate second derivative using finite differences
+            for j in range(1, len(strikes_sorted)-1):
+                K_prev, K_curr, K_next = strikes_sorted[j-1], strikes_sorted[j], strikes_sorted[j+1]
+                C_prev, C_curr, C_next = calls_sorted[j-1], calls_sorted[j], calls_sorted[j+1]
+                
+                # Second derivative approximation
+                second_deriv = (C_next - 2*C_curr + C_prev) / ((K_next - K_curr) * (K_curr - K_prev))
+                
+                if second_deriv < -tolerance:
+                    arbitrage_free = False
+                    self.arbitrage_violations['butterfly'].append(
+                        (T, K_curr, second_deriv, f"Butterfly arbitrage at T={T:.3f}, K={K_curr:.4f}")
+                    )
+        return arbitrage_free
 
-    return updated
+    def check_calendar_arbitrage(self, tolerance: float = 1e-5) -> bool:
+        """
+        Check for calendar arbitrage (monotonic total variance)
+        Proposition: Total variance σ²T must be non-decreasing with maturity :cite[1]
+        If σ₂²T₂ < σ₁²T₁ for T₂ > T₁, calendar arbitrage exists
+        """
+        arbitrage_free = True
+        
+        # Calculate total variance for ATM (delta=0.5)
+        atm_vols = []
+        valid_times = []
+        
+        for i, T in enumerate(self.times_to_maturity):
+            if T > 0:
+                # Find vol for delta closest to 0.5 (ATM)
+                atm_idx = np.argmin(np.abs(self.delta_grid - 0.5))
+                atm_vol = self.implied_vols[i, atm_idx]
+                atm_vols.append(atm_vol)
+                valid_times.append(T)
+        
+        # Sort by maturity
+        sort_idx = np.argsort(valid_times)
+        sorted_times = np.array(valid_times)[sort_idx]
+        sorted_vols = np.array(atm_vols)[sort_idx]
+        
+        # Check monotonicity of total variance
+        for i in range(1, len(sorted_times)):
+            total_var_prev = sorted_vols[i-1]**2 * sorted_times[i-1]
+            total_var_curr = sorted_vols[i]**2 * sorted_times[i]
+            
+            if total_var_curr < total_var_prev - tolerance:
+                arbitrage_free = False
+                self.arbitrage_violations['calendar'].append(
+                    (sorted_times[i], total_var_curr, 
+                     f"Calendar arbitrage: σ²T decreases from {total_var_prev:.6f} to {total_var_curr:.6f} at T={sorted_times[i]:.3f}")
+                )
+        return arbitrage_free
+
+    def check_vertical_arbitrage(self, tolerance: float = 1e-5) -> bool:
+        """
+        Check for vertical (spread) arbitrage
+        Proposition: Call prices must be non-increasing with strike :cite[1]
+        C(K₁) ≥ C(K₂) for K₁ < K₂
+        """
+        arbitrage_free = True
+        for i, T in enumerate(self.times_to_maturity):
+            strikes = self.strike_grid[i]
+            call_prices = self.call_prices[i]
+            
+            # Sort by strike
+            sort_idx = np.argsort(strikes)
+            strikes_sorted = strikes[sort_idx]
+            calls_sorted = call_prices[sort_idx]
+            
+            # Check monotonicity
+            for j in range(1, len(strikes_sorted)):
+                if calls_sorted[j] > calls_sorted[j-1] + tolerance:
+                    arbitrage_free = False
+                    self.arbitrage_violations['vertical'].append(
+                        (T, strikes_sorted[j], 
+                         f"Vertical arbitrage: C({strikes_sorted[j]:.4f}) = {calls_sorted[j]:.6f} > C({strikes_sorted[j-1]:.4f}) = {calls_sorted[j-1]:.6f} at T={T:.3f}")
+                    )
+        return arbitrage_free
+
+    def run_all_arbitrage_checks(self) -> Dict[str, bool]:
+        """Run all arbitrage checks and return results"""
+        results = {
+            'butterfly': self.check_butterfly_arbitrage(),
+            'calendar': self.check_calendar_arbitrage(),
+            'vertical': self.check_vertical_arbitrage()
+        }
+        return results
+
+    def plot_arbitrage_analysis(self):
+        """Plot the three required surfaces with arbitrage violations highlighted"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('FX Implied Volatility Surface Arbitrage Analysis', fontsize=16)
+        
+        self._plot_call_price_surface(axes[0, 0])
+        self._plot_implied_vol_by_log_moneyness(axes[0, 1])
+        self._plot_implied_vol_by_delta(axes[1, 0])
+        self._plot_arbitrage_summary(axes[1, 1])
+        
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_call_price_surface(self, ax):
+        """Plot call price surface"""
+        T_grid, K_grid = np.meshgrid(self.times_to_maturity, self.strike_grid[0], indexing='ij')
+        call_surface = np.zeros_like(T_grid)
+        
+        for i in range(len(self.times_to_maturity)):
+            for j in range(len(self.strike_grid[0])):
+                call_surface[i, j] = self.call_prices[i, j]
+        
+        contour = ax.contourf(T_grid, K_grid, call_surface, levels=20, cmap='viridis')
+        ax.set_xlabel('Time to Maturity (T)')
+        ax.set_ylabel('Strike Price (K)')
+        ax.set_title('Call Price Surface C(T,K)')
+        plt.colorbar(contour, ax=ax, label='Call Price')
+        
+        # Highlight arbitrage points
+        self._highlight_arbitrage_points(ax, 'butterfly', 'red', 'Butterfly')
+        self._highlight_arbitrage_points(ax, 'vertical', 'yellow', 'Vertical')
+
+    def _plot_implied_vol_by_log_moneyness(self, ax):
+        """Plot implied volatility by log-moneyness"""
+        for i, T in enumerate(self.times_to_maturity):
+            if T > 0:
+                F = self.spot * np.exp((self.domestic_rate - self.foreign_rate) * T)
+                log_moneyness = np.log(self.strike_grid[i] / F)
+                
+                # Sort by log moneyness
+                sort_idx = np.argsort(log_moneyness)
+                ax.plot(log_moneyness[sort_idx], self.implied_vols[i][sort_idx], 
+                       marker='o', label=f'T={T:.2f}')
+        
+        ax.set_xlabel('Log-Moneyness ln(K/F)')
+        ax.set_ylabel('Implied Volatility')
+        ax.set_title('Implied Volatility by Log-Moneyness')
+        ax.legend()
+        ax.grid(True)
+
+    def _plot_implied_vol_by_delta(self, ax):
+        """Plot implied volatility by delta"""
+        for i, T in enumerate(self.times_to_maturity):
+            if T > 0:
+                ax.plot(self.delta_grid, self.implied_vols[i], 
+                       marker='s', label=f'T={T:.2f}')
+        
+        ax.set_xlabel('Delta (Spot)')
+        ax.set_ylabel('Implied Volatility')
+        ax.set_title('Implied Volatility by Delta')
+        ax.legend()
+        ax.grid(True)
+
+    def _plot_arbitrage_summary(self, ax):
+        """Plot summary of arbitrage violations"""
+        violation_types = list(self.arbitrage_violations.keys())
+        violation_counts = [len(self.arbitrage_violations[v_type]) for v_type in violation_types]
+        
+        bars = ax.bar(violation_types, violation_counts, color=['red' if count > 0 else 'green' for count in violation_counts])
+        ax.set_ylabel('Number of Violations')
+        ax.set_title('Arbitrage Violations Summary')
+        
+        for bar, count in zip(bars, violation_counts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, 
+                   str(count), ha='center', va='bottom')
+
+    def _highlight_arbitrage_points(self, ax, violation_type: str, color: str, label: str):
+        """Highlight arbitrage points on plots"""
+        violations = self.arbitrage_violations[violation_type]
+        for violation in violations:
+            T, K, *_, = violation
+            ax.plot(T, K, marker='x', color=color, markersize=10, markeredgewidth=3, label=label if 'x' not in ax.get_legend_handles_labels()[1] else "")
+
+def create_sample_vol_surface() -> FXVolSurface:
+    """
+    Create a sample volatility surface for testing
+    This represents a typical FX vol surface with some potential arbitrage
+    """
+    # Sample data: times, deltas, and implied volatilities
+    times_to_maturity = np.array([0.1, 0.25, 0.5, 1.0])  # years
+    delta_grid = np.array([0.1, 0.25, 0.5, 0.75, 0.9])  # spot deltas
+    
+    # Sample implied vol surface (volatility matrix)
+    implied_vols = np.array([
+        [0.125, 0.120, 0.118, 0.121, 0.128],  # 1M
+        [0.130, 0.125, 0.322, 0.126, 0.133],  # 3M  
+        [0.135, 0.128, 0.125, 0.129, 0.136],  # 6M
+        [0.140, 0.132, 0.128, 0.133, 0.140]   # 1Y
+    ])
+    
+    # Market parameters
+    spot = 1.1000  # EURUSD
+    domestic_rate = 0.05   # USD rate
+    foreign_rate = 0.03    # EUR rate
+    
+    return FXVolSurface(times_to_maturity, delta_grid, implied_vols, 
+                       spot, domestic_rate, foreign_rate)
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Create sample volatility surface
+    vol_surface = create_sample_vol_surface()
+    
+    # Run all arbitrage checks
+    print("Running arbitrage checks...")
+    results = vol_surface.run_all_arbitrage_checks()
+    
+    # Print results
+    print("\n=== ARBITRAGE CHECK RESULTS ===")
+    for check_type, is_arbitrage_free in results.items():
+        status = "PASS" if is_arbitrage_free else "FAIL"
+        print(f"{check_type.upper():<15}: {status}")
+        
+        # Print violation details
+        violations = vol_surface.arbitrage_violations[check_type]
+        for violation in violations:
+            print(f"  - {violation[-1]}")
+    
+    # Plot comprehensive analysis
+    print("\nGenerating arbitrage analysis plots...")
+    vol_surface.plot_arbitrage_analysis()
