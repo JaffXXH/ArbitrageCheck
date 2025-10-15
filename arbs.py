@@ -1,491 +1,341 @@
-"""
-fx_iv_arbitrage.py
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
-Single-file module:
-- Smile reconstruction from ATM, RR, STR (BF) for 10Δ and 25Δ nodes
-- Delta-to-strike conversion (Black forward delta)
-- Butterfly arbitrage checks per tenor via call price convexity in strike
-- Calendar arbitrage checks across tenors via total variance monotonicity and price-in-time
-- Time interpolation methods for implied volatility (variance-linear, vol-linear, log-variance-linear)
-
-Author: (c) 2025
-"""
-
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-import math
-
-
-# -----------------------------
-# Core math: Normal, Black call
-# -----------------------------
-
-SQRT_2PI = math.sqrt(2.0 * math.pi)
-
-def _norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / SQRT_2PI
-
-def _norm_cdf(x: float) -> float:
-    # Abramowitz-Stegun approximation (sufficient for checks; use mpmath for higher precision if needed)
-    # For quantitative desk-grade precision, consider importing scipy.stats.norm.cdf.
-    k = 1.0 / (1.0 + 0.2316419 * abs(x))
-    a1, a2, a3, a4, a5 = 0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429
-    poly = ((((a5 * k + a4) * k + a3) * k + a2) * k + a1) * k
-    approx = 1.0 - _norm_pdf(abs(x)) * poly
-    return approx if x >= 0 else 1.0 - approx
-
-def black_call_price(F: float, K: float, T: float, sigma: float, DF: float = 1.0) -> float:
+# ================================
+# FX Black (Garman–Kohlhagen)
+# ================================
+def fx_call_price_gk(S, K, T, rd, rf, sigma):
     """
-    Black-76 forward call: C = DF * [ F N(d1) - K N(d2) ]
+    European FX call price:
+    C = S * exp(-rf*T) * N(d1) - K * exp(-rd*T) * N(d2),
+    d1 = [ln(S/K) + (rd - rf + 0.5*sigma^2)T]/(sigma*sqrt(T)),
+    d2 = d1 - sigma*sqrt(T).
     """
-    if sigma <= 0 or T <= 0 or F <= 0 or K <= 0 or DF <= 0:
-        return max(DF * (F - K), 0.0)  # degenerate guard
-    vol_sqrt_t = sigma * math.sqrt(T)
-    d1 = (math.log(F / K) + 0.5 * vol_sqrt_t * vol_sqrt_t) / vol_sqrt_t
+    if np.any(T <= 0):
+        raise ValueError("All maturities must be strictly positive.")
+    from scipy.stats import norm
+
+    S = np.asarray(S, float)
+    K = np.asarray(K, float)
+    T = np.asarray(T, float)
+    rd = np.asarray(rd, float)
+    rf = np.asarray(rf, float)
+    sigma = np.asarray(sigma, float)
+
+    vol_sqrt_t = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (rd - rf + 0.5 * sigma**2) * T) / vol_sqrt_t
     d2 = d1 - vol_sqrt_t
-    return DF * (F * _norm_cdf(d1) - K * _norm_cdf(d2))
 
-def black_forward_delta_call(F: float, K: float, T: float, sigma: float) -> float:
+    return S * np.exp(-rf * T) * norm.cdf(d1) - K * np.exp(-rd * T) * norm.cdf(d2)
+
+
+def fx_call_delta_spot(S, K, T, rd, rf, sigma):
+    from scipy.stats import norm
+    vol_sqrt_t = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (rd - rf + 0.5 * sigma**2) * T) / vol_sqrt_t
+    return np.exp(-rf * T) * norm.cdf(d1)
+
+
+# ================================
+# Helpers
+# ================================
+def forward_price(S, T, rd, rf):
+    return S * np.exp((rd - rf) * T)
+
+def log_moneyness(S, K, T, rd, rf):
+    F = forward_price(S, T, rd, rf)
+    return np.log(K / F)
+
+def normalize_calls(C, K, T, S, rd, rf):
+    F = forward_price(S, T, rd, rf)
+    x = K / F
+    Cn = C / F
+    return x, Cn
+
+
+# ================================
+# Static arbitrage checks
+# ================================
+def check_vertical_spread_monotonicity(C_row, K_row, tol=1e-12):
     """
-    Forward delta for a call under Black-76: Δ_fwd = N(d1)
+    For fixed T, C(K) must be non-increasing in K.
+    Flags indices where C(K_{i+1}) > C(K_i) + tol.
     """
-    if sigma <= 0 or T <= 0 or F <= 0 or K <= 0:
-        return 1.0 if F > K else 0.0
-    vol_sqrt_t = sigma * math.sqrt(T)
-    d1 = (math.log(F / K) + 0.5 * vol_sqrt_t * vol_sqrt_t) / vol_sqrt_t
-    return _norm_cdf(d1)
+    idx = np.argsort(K_row)
+    K = K_row[idx]
+    C = C_row[idx]
+    diff = np.diff(C)
+    viol_positions = np.where(diff > tol)[0] + 1
+    viol_mask_sorted = np.zeros_like(C, dtype=bool)
+    viol_mask_sorted[viol_positions] = True
+    # map back to original order
+    viol_mask = np.zeros_like(C_row, dtype=bool)
+    viol_mask[idx] = viol_mask_sorted
+    return viol_mask, {"sorted_indices": idx.tolist(), "viol_positions_sorted": viol_positions.tolist()}
 
-def strike_from_forward_delta_call(F: float, T: float, sigma: float, delta: float) -> float:
+
+def check_butterfly_convexity_triad(C_row, K_row, tol=1e-12):
     """
-    Invert Δ_fwd = N(d1) to get K:
-    d1 = N^{-1}(delta), d1 = [ln(F/K) + 0.5 σ^2 T] / (σ √T)
-    => ln(F/K) = d1 σ √T - 0.5 σ^2 T
-    => K = F / exp(d1 σ √T - 0.5 σ^2 T)
+    Rigorous triad convexity:
+    For any adjacent triplet K1<K2<K3,
+        C(K2) <= w*C(K1) + (1-w)*C(K3)
+    where w = (K3 - K2) / (K3 - K1).
+    Violations imply negative-cost butterfly.
+    Flags the middle index (K2) when inequality fails.
     """
-    if not (0.0 < delta < 1.0):
-        raise ValueError("Delta must be in (0,1) for call.")
-    if sigma <= 0 or T <= 0 or F <= 0:
-        raise ValueError("Invalid inputs for strike inversion.")
-    # Inverse CDF via binary search (sufficient accuracy for desk checks)
-    d1 = _inv_norm_cdf(delta)
-    vol_sqrt_t = sigma * math.sqrt(T)
-    ln_F_over_K = d1 * vol_sqrt_t - 0.5 * sigma * sigma * T
-    return F / math.exp(ln_F_over_K)
+    idx = np.argsort(K_row)
+    K = K_row[idx]
+    C = C_row[idx]
+    n = len(K)
+    viol_mask_sorted = np.zeros(n, dtype=bool)
+    bad_triplets = []
 
-def _inv_norm_cdf(p: float) -> float:
+    for i in range(1, n - 1):
+        K1, K2, K3 = K[i - 1], K[i], K[i + 1]
+        C1, C2, C3 = C[i - 1], C[i], C[i + 1]
+        denom = (K3 - K1)
+        if denom <= 0:
+            continue
+        w = (K3 - K2) / denom
+        rhs = w * C1 + (1 - w) * C3
+        if C2 > rhs + tol:
+            viol_mask_sorted[i] = True
+            bad_triplets.append({"i_mid_sorted": i, "K_triplet": (K1, K2, K3), "C_triplet": (C1, C2, C3), "w": w, "rhs": rhs})
+
+    viol_mask = np.zeros_like(C_row, dtype=bool)
+    viol_mask[idx] = viol_mask_sorted
+    return viol_mask, {"sorted_indices": idx.tolist(), "bad_triplets": bad_triplets}
+
+
+def check_calendar_monotonicity(C_grid, T, tol=1e-12):
     """
-    Approximation for inverse standard normal CDF (Moro's algorithm variant).
+    For fixed K, C(T) must be non-decreasing in T.
+    Flags positions where C(T_{j+1}) < C(T_j) - tol.
     """
-    if p <= 0.0 or p >= 1.0:
-        raise ValueError("p must be in (0,1).")
-    # Coefficients
-    a = [2.50662823884, -18.61500062529, 41.39119773534, -25.44106049637]
-    b = [-8.47351093090, 23.08336743743, -21.06224101826, 3.13082909833]
-    c = [0.3374754822726147, 0.9761690190917186, 0.1607979714918209,
-         0.0276438810333863, 0.0038405729373609, 0.0003951896511919,
-         0.0000321767881768, 0.0000002888167364, 0.0000003960315187]
-    # Central region
-    x = p - 0.5
-    if abs(x) < 0.42:
-        r = x * x
-        num = x * (((a[3] * r + a[2]) * r + a[1]) * r + a[0])
-        den = (((b[3] * r + b[2]) * r + b[1]) * r + b[0]) * r + 1.0
-        return num / den
-    # Tail region
-    r = p if x > 0 else 1.0 - p
-    s = math.log(-math.log(r))
-    t = c[0] + s * (c[1] + s * (c[2] + s * (c[3] + s * (c[4] + s * (c[5] + s * (c[6] + s * (c[7] + s * c[8])))))))
-    return t if x > 0 else -t
+    nT, nK = C_grid.shape
+    viol = np.zeros_like(C_grid, dtype=bool)
+    details = []
+    for k in range(nK):
+        Ck = C_grid[:, k]
+        dC = np.diff(Ck)
+        bad = np.where(dC < -tol)[0]
+        if bad.size > 0:
+            viol[bad + 1, k] = True
+            details.append({"K_index": k, "T_indices": (bad + 1).tolist()})
+    return viol, details
 
 
-# -----------------------------
-# Data structures
-# -----------------------------
-
-@dataclass
-class TenorQuote:
+def check_price_bounds(C_row, K_row, T, S, rd, rf, tol=1e-12):
     """
-    FX desk-style quotes per tenor:
-    - ATM: at-the-money implied volatility (log-moneyness ~ 0)
-    - RR25: 25Δ risk reversal (vol_call25 - vol_put25)
-    - STR25 (BF25): 25Δ butterfly = 0.5*(vol_call25 + vol_put25) - vol_ATM
-    - RR10: 10Δ risk reversal
-    - STR10 (BF10): 10Δ butterfly
-    Conventions: Δ are forward call deltas 0.25 and 0.10 for 'call', with puts symmetric via RR.
+    Bounds for European call:
+      Lower bound: max(0, S*e^{-rf T} - K*e^{-rd T})
+      Upper bound: S*e^{-rf T}
+    Flags violations beyond tolerance.
     """
-    ATM: float
-    RR25: float
-    STR25: float
-    RR10: float
-    STR10: float
+    disc_f = np.exp(-rf * T)
+    disc_d = np.exp(-rd * T)
+    lower = np.maximum(0.0, S * disc_f - K_row * disc_d)
+    upper = S * disc_f
+    low_viol = C_row < lower - tol
+    up_viol = C_row > upper + tol
+    mask = low_viol | up_viol
+    details = {"lower_bound": lower, "upper_bound": upper,
+               "lower_viol_indices": np.where(low_viol)[0].tolist(),
+               "upper_viol_indices": np.where(up_viol)[0].tolist()}
+    return mask, details
 
 
-@dataclass
-class MarketTenor:
+def check_forward_normalized_limits(C_row, K_row, T, S, rd, rf, tol=1e-12):
     """
-    Market data required per tenor for pricing and checks:
-    - T: time to maturity in years
-    - F: forward price for the FX pair at this tenor
-    - DF: discount factor to maturity (optional, default 1.0)
+    In forward-normalized space Cn(K/F):
+      As K->0: Cn ~ 1
+      As K->infty: Cn -> 0
+    We test near the grid edges for gross violations.
     """
-    T: float
-    F: float
-    DF: float = 1.0
+    x, Cn = normalize_calls(C_row, K_row, T, S, rd, rf)
+    idx = np.argsort(x)
+    x_sorted = x[idx]
+    Cn_sorted = Cn[idx]
+    edge_mask = np.zeros_like(C_row, dtype=bool)
+    details = {}
+
+    # Leftmost should not be << 1 by more than tol (not a strict inequality, just a sanity check)
+    if Cn_sorted[0] < -tol or Cn_sorted[0] > 1 + tol:
+        edge_mask[idx[0]] = True
+        details["left_edge"] = {"x": x_sorted[0], "Cn": Cn_sorted[0]}
+    # Rightmost should not exceed small positive tolerance
+    if Cn_sorted[-1] < -tol or Cn_sorted[-1] > 0 + 1e-2:
+        edge_mask[idx[-1]] = True
+        details["right_edge"] = {"x": x_sorted[-1], "Cn": Cn_sorted[-1]}
+    return edge_mask, details
 
 
-@dataclass
-class SmileNode:
+# ================================
+# Main evaluation and plotting
+# ================================
+def evaluate_fx_iv_arbitrage_and_plot(
+    iv_grid, maturities, strikes, S, rd, rf, plot=True, tol=1e-12
+):
     """
-    A node on the smile with:
-    - label: e.g., '10P', '10C', '25P', '25C', 'ATM'
-    - delta: forward call delta for calls; use 1 - delta for puts when mapping (we store canonical call delta)
-    - K: strike corresponding to delta under Black, using node's vol
-    - vol: implied volatility at this node
+    Inputs:
+      iv_grid: [nT, nK] implied vols
+      maturities: [nT]
+      strikes: [nK], strictly increasing
+      S, rd, rf: scalars
+    Output:
+      dict of prices and violation masks/details.
     """
-    label: str
-    delta: float
-    K: float
-    vol: float
+    iv_grid = np.asarray(iv_grid, float)
+    T = np.asarray(maturities, float)
+    K = np.asarray(strikes, float)
+    if np.any(np.diff(K) <= 0):
+        raise ValueError("Strikes must be strictly increasing.")
+
+    nT, nK = iv_grid.shape
+    if nT != len(T) or nK != len(K):
+        raise ValueError("iv_grid shape must match maturities and strikes.")
+
+    # Price grid
+    call_prices = np.zeros_like(iv_grid)
+    for i in range(nT):
+        call_prices[i, :] = fx_call_price_gk(S, K, T[i], rd, rf, iv_grid[i, :])
+
+    # Checks (per maturity)
+    vertical_mask = np.zeros_like(iv_grid, dtype=bool)
+    butterfly_mask = np.zeros_like(iv_grid, dtype=bool)
+    bounds_mask = np.zeros_like(iv_grid, dtype=bool)
+    edge_mask = np.zeros_like(iv_grid, dtype=bool)
+
+    vertical_details = []
+    butterfly_details = []
+    bounds_details = []
+    edge_details = []
+
+    for i in range(nT):
+        vmask, vdet = check_vertical_spread_monotonicity(call_prices[i, :], K, tol)
+        bmask, bdet = check_butterfly_convexity_triad(call_prices[i, :], K, tol)
+        pmask, pdet = check_price_bounds(call_prices[i, :], K, T[i], S, rd, rf, tol)
+        emask, edet = check_forward_normalized_limits(call_prices[i, :], K, T[i], S, rd, rf, tol)
+
+        vertical_mask[i, :] = vmask
+        butterfly_mask[i, :] = bmask
+        bounds_mask[i, :] = pmask
+        edge_mask[i, :] = emask
+
+        vdet["T_index"] = i
+        bdet["T_index"] = i
+        pdet["T_index"] = i
+        edet["T_index"] = i
+        vertical_details.append(vdet)
+        butterfly_details.append(bdet)
+        bounds_details.append(pdet)
+        edge_details.append(edet)
+
+    # Calendar across maturities
+    calendar_mask, calendar_details = check_calendar_monotonicity(call_prices, T, tol)
+
+    any_violation = vertical_mask | butterfly_mask | calendar_mask | bounds_mask | edge_mask
+
+    # Plots
+    if plot:
+        TT, KK = np.meshgrid(T, K, indexing='ij')
+        fig = plt.figure(figsize=(16, 12))
+
+        # 1) Call surface
+        ax1 = fig.add_subplot(221, projection='3d')
+        surf = ax1.plot_surface(TT, KK, call_prices, cmap=cm.viridis, alpha=0.85, linewidth=0)
+        ax1.set_title("FX call price surface (Garman–Kohlhagen)")
+        ax1.set_xlabel("Maturity T")
+        ax1.set_ylabel("Strike K")
+        ax1.set_zlabel("Call price")
+        fig.colorbar(surf, shrink=0.5, aspect=12, pad=0.1)
+        vt = TT[any_violation]
+        vk = KK[any_violation]
+        vc = call_prices[any_violation]
+        ax1.scatter(vt, vk, vc, color='red', s=30, label='Violation')
+        ax1.legend(loc='best')
+
+        # 2) IV vs log-moneyness
+        ax2 = fig.add_subplot(222)
+        for i in range(nT):
+            m = log_moneyness(S, K, T[i], rd, rf)
+            ax2.plot(m, iv_grid[i, :], label=f"T={T[i]:.3f}", alpha=0.85)
+            idx_viol = np.where(any_violation[i, :])[0]
+            if idx_viol.size > 0:
+                ax2.scatter(m[idx_viol], iv_grid[i, idx_viol], color='red', s=32)
+        ax2.set_title("Implied volatility by log-moneyness ln(K/F)")
+        ax2.set_xlabel("ln(K/F)")
+        ax2.set_ylabel("Implied volatility")
+        ax2.legend(ncol=2, fontsize=8)
+
+        # 3) IV vs spot delta
+        ax3 = fig.add_subplot(223)
+        for i in range(nT):
+            deltas = fx_call_delta_spot(S, K, T[i], rd, rf, iv_grid[i, :])
+            ax3.plot(deltas, iv_grid[i, :], label=f"T={T[i]:.3f}", alpha=0.85)
+            idx_viol = np.where(any_violation[i, :])[0]
+            if idx_viol.size > 0:
+                ax3.scatter(deltas[idx_viol], iv_grid[i, idx_viol], color='red', s=32)
+        ax3.set_title("Implied volatility by spot delta")
+        ax3.set_xlabel("Delta (spot)")
+        ax3.set_ylabel("Implied volatility")
+        ax3.legend(ncol=2, fontsize=8)
+
+        # 4) Violation heatmap
+        ax4 = fig.add_subplot(224)
+        im = ax4.imshow(any_violation, aspect='auto', origin='lower',
+                        extent=[K.min(), K.max(), T.min(), T.max()], cmap='Reds', alpha=0.75)
+        ax4.set_title("Violation heatmap (any type)")
+        ax4.set_xlabel("Strike K")
+        ax4.set_ylabel("Maturity T")
+        fig.colorbar(im, ax=ax4, shrink=0.8, pad=0.05)
+
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "call_prices": call_prices,
+        "vertical_spread_violations_mask": vertical_mask,
+        "butterfly_violations_mask": butterfly_mask,
+        "calendar_violations_mask": calendar_mask,
+        "bounds_violations_mask": bounds_mask,
+        "edge_limits_violations_mask": edge_mask,
+        "details": {
+            "vertical": vertical_details,
+            "butterfly": butterfly_details,
+            "calendar": calendar_details,
+            "bounds": bounds_details,
+            "edge_limits": edge_details,
+        },
+        "any_violation_mask": any_violation
+    }
 
 
-# -----------------------------
-# Smile construction
-# -----------------------------
-
-class SmileBuilder:
-    """
-    Construct discrete smile nodes (10Δ, 25Δ put/call and ATM) from ATM/RR/STR quotes.
-    """
-
-    def __init__(self, quote: TenorQuote, market: MarketTenor):
-        self.q = quote
-        self.mkt = market
-
-    def build_nodes(self) -> List[SmileNode]:
-        """
-        Build smile nodes using standard FX vol quoting identities:
-
-        Let:
-        RR_x = vol_call_x - vol_put_x
-        BF_x (STR_x) = 0.5*(vol_call_x + vol_put_x) - vol_ATM
-
-        => vol_call_x = vol_ATM + BF_x + 0.5 * RR_x
-        => vol_put_x  = vol_ATM + BF_x - 0.5 * RR_x
-
-        Nodes:
-        - 10C: delta=0.10, vol as above
-        - 10P: symmetric put, we store as label '10P' but use call-delta 0.90 when converting (equivalently, for put we can use Δ_call=1-Δ_put)
-        - 25C, 25P
-        - ATM: label 'ATM' with delta ~ 0.5 (we set strike K=F under Black ATM; delta implied by sigma and T)
-        """
-        ATM = self.q.ATM
-
-        vol_25c = ATM + self.q.STR25 + 0.5 * self.q.RR25
-        vol_25p = ATM + self.q.STR25 - 0.5 * self.q.RR25
-        vol_10c = ATM + self.q.STR10 + 0.5 * self.q.RR10
-        vol_10p = ATM + self.q.STR10 - 0.5 * self.q.RR10
-
-        # Construct strikes from deltas using each node's vol
-        nodes = []
-
-        # 10C: Δ_call = 0.10
-        K_10c = strike_from_forward_delta_call(self.mkt.F, self.mkt.T, vol_10c, 0.10)
-        nodes.append(SmileNode(label="10C", delta=0.10, K=K_10c, vol=vol_10c))
-
-        # 10P: for a put with 10Δ_put, the corresponding call delta is 1 - Δ_put = 0.90
-        K_10p = strike_from_forward_delta_call(self.mkt.F, self.mkt.T, vol_10p, 0.90)
-        nodes.append(SmileNode(label="10P", delta=0.90, K=K_10p, vol=vol_10p))
-
-        # 25C
-        K_25c = strike_from_forward_delta_call(self.mkt.F, self.mkt.T, vol_25c, 0.25)
-        nodes.append(SmileNode(label="25C", delta=0.25, K=K_25c, vol=vol_25c))
-
-        # 25P: call-delta = 0.75
-        K_25p = strike_from_forward_delta_call(self.mkt.F, self.mkt.T, vol_25p, 0.75)
-        nodes.append(SmileNode(label="25P", delta=0.75, K=K_25p, vol=vol_25p))
-
-        # ATM: set K = F, vol = ATM
-        nodes.append(SmileNode(label="ATM", delta=0.5, K=self.mkt.F, vol=ATM))
-
-        # Sort nodes by strike ascending to facilitate butterfly checks
-        nodes.sort(key=lambda n: n.K)
-        return nodes
-
-
-# -----------------------------
-# Arbitrage checks
-# -----------------------------
-
-class ArbitrageChecker:
-    """
-    Arbitrage checks for:
-    - Butterfly arbitrage per tenor: call price is decreasing in strike and convex in strike.
-    - Calendar arbitrage across tenors: total variance and call price monotonicity in maturity for fixed strike buckets.
-    """
-
-    def __init__(self, nodes_by_tenor: Dict[str, List[SmileNode]], market_by_tenor: Dict[str, MarketTenor]):
-        """
-        nodes_by_tenor: mapping tenor key -> list of SmileNode (sorted by strike)
-        market_by_tenor: mapping tenor key -> MarketTenor (T, F, DF)
-        """
-        self.nodes_by_tenor = nodes_by_tenor
-        self.market_by_tenor = market_by_tenor
-
-    # ----- Butterfly per tenor -----
-
-    def check_butterfly(self, epsilon_monotone: float = 1e-8, epsilon_convex: float = -1e-8) -> Dict[str, Dict]:
-        """
-        For each tenor:
-        - Monotonicity: C(K_i) >= C(K_{i+1})  (call price decreases with strike)
-        - Convexity: discrete second difference >= 0
-
-        Returns per tenor:
-            {
-                'tenor': {
-                    'monotone_ok': bool,
-                    'convex_ok': bool,
-                    'violations': [str messages]
-                }
-            }
-        """
-        result = {}
-        for tenor, nodes in self.nodes_by_tenor.items():
-            mkt = self.market_by_tenor[tenor]
-            Ks = [n.K for n in nodes]
-            vols = [n.vol for n in nodes]
-            prices = [black_call_price(mkt.F, K, mkt.T, v, mkt.DF) for K, v in zip(Ks, vols)]
-
-            violations = []
-
-            # Monotonicity: non-increasing in strike
-            monotone_ok = True
-            for i in range(len(Ks) - 1):
-                if prices[i] + epsilon_monotone < prices[i + 1]:
-                    monotone_ok = False
-                    violations.append(f"Monotonicity violated: C(K={Ks[i]:.6f}) < C(K_next={Ks[i+1]:.6f})")
-
-            # Convexity: discrete second derivative >= 0
-            convex_ok = True
-            for i in range(1, len(Ks) - 1):
-                K_prev, K_mid, K_next = Ks[i - 1], Ks[i], Ks[i + 1]
-                C_prev, C_mid, C_next = prices[i - 1], prices[i], prices[i + 1]
-                # Second finite difference scaled by spacing (nonuniform grid handling via divided differences)
-                # Using standard test: sec_diff ≈ ( (C_next - C_mid)/(K_next-K_mid) - (C_mid - C_prev)/(K_mid-K_prev) )
-                left_slope = (C_mid - C_prev) / (K_mid - K_prev)
-                right_slope = (C_next - C_mid) / (K_next - K_mid)
-                sec_diff = right_slope - left_slope
-                if sec_diff < epsilon_convex:
-                    convex_ok = False
-                    violations.append(f"Convexity violated around K={K_mid:.6f}: second diff = {sec_diff:.6e}")
-
-            result[tenor] = {
-                'monotone_ok': monotone_ok,
-                'convex_ok': convex_ok,
-                'violations': violations
-            }
-        return result
-
-    # ----- Calendar across tenors -----
-
-    def _collect_strike_buckets(self) -> Dict[str, List[Tuple[float, float, float]]]:
-        """
-        Collect common strike buckets across tenors by node label.
-        Returns mapping: label -> list of (T, K, vol) across tenors that have this node.
-        """
-        buckets: Dict[str, List[Tuple[float, float, float]]] = {}
-        for tenor, nodes in self.nodes_by_tenor.items():
-            T = self.market_by_tenor[tenor].T
-            for n in nodes:
-                buckets.setdefault(n.label, []).append((T, n.K, n.vol))
-        # Sort by T within each bucket
-        for label in buckets:
-            buckets[label].sort(key=lambda x: x[0])
-        return buckets
-
-    def check_calendar(self, epsilon_var: float = -1e-12, epsilon_price: float = -1e-8,
-                       forwards_by_tenor: Optional[Dict[str, float]] = None,
-                       dfs_by_tenor: Optional[Dict[str, float]] = None) -> Dict[str, Dict]:
-        """
-        Calendar no-arb:
-        - Total variance monotonicity at fixed strike bucket: w(T) = σ^2(T) T should be non-decreasing in T.
-        - Call price monotonicity at fixed (approximate) strike: C(T) should be non-decreasing in T, accounting for forward/DF per tenor.
-
-        Returns per label:
-            {
-              'label': {
-                 'variance_monotone_ok': bool,
-                 'price_monotone_ok': bool,
-                 'violations': [str]
-              }
-            }
-
-        Note:
-        - Buckets use node labels (ATM, 10C, 10P, 25C, 25P). Their strikes differ slightly across tenors due to delta-to-strike dependence on vol,
-          but desk practice accepts price monotonicity checks on these canonical buckets as a pragmatic calendar sanity check.
-        """
-        buckets = self._collect_strike_buckets()
-        result = {}
-
-        # Build helper to find MarketTenor by T (we assume unique T per tenor key)
-        # Map T -> (F, DF)
-        T_to_mkt: Dict[float, Tuple[float, float]] = {}
-        for tenor, m in self.market_by_tenor.items():
-            T_to_mkt[m.T] = (m.F, m.DF)
-
-        for label, series in buckets.items():
-            violations = []
-            # Variance monotonicity
-            variances = [vol * vol * T for (T, _, vol) in series]
-            variance_monotone_ok = True
-            for i in range(len(variances) - 1):
-                if variances[i + 1] + epsilon_var < variances[i]:
-                    variance_monotone_ok = False
-                    t0, t1 = series[i][0], series[i + 1][0]
-                    violations.append(f"Variance decreased between T={t0:.6f} and T={t1:.6f}: w0={variances[i]:.6e}, w1={variances[i+1]:.6e}")
-
-            # Price monotonicity across T using bucket strikes
-            price_monotone_ok = True
-            prices = []
-            for (T, K, vol) in series:
-                F, DF = T_to_mkt[T]
-                prices.append(black_call_price(F, K, T, vol, DF))
-            for i in range(len(prices) - 1):
-                if prices[i + 1] + epsilon_price < prices[i]:
-                    price_monotone_ok = False
-                    t0, t1 = series[i][0], series[i + 1][0]
-                    violations.append(f"Call price decreased between T={t0:.6f} and T={t1:.6f}: C0={prices[i]:.6e}, C1={prices[i+1]:.6e}")
-
-            result[label] = {
-                'variance_monotone_ok': variance_monotone_ok,
-                'price_monotone_ok': price_monotone_ok,
-                'violations': violations
-            }
-        return result
-
-
-# -----------------------------
-# Time interpolation of IV
-# -----------------------------
-
-class TimeInterpolator:
-    """
-    Time interpolation methods for implied volatility term structure.
-    Provides:
-    - Linear in total variance (w = σ^2 T)
-    - Linear in volatility (σ)
-    - Linear in log total variance (log w)
-    """
-
-    @staticmethod
-    def linear_variance(T: float, T0: float, sigma0: float, T1: float, sigma1: float) -> float:
-        """
-        Interpolate linearly in total variance:
-        w(T) = w0 + (w1 - w0) * ((T - T0) / (T1 - T0)), with w = σ^2 T, then σ(T) = sqrt(w(T)/T)
-
-        This preserves calendar monotonicity if w0 <= w1 and T within [T0, T1].
-        """
-        if not (T0 < T < T1) or T <= 0:
-            raise ValueError("Require T in (T0, T1) and T>0.")
-        w0, w1 = sigma0 * sigma0 * T0, sigma1 * sigma1 * T1
-        wT = w0 + (w1 - w0) * ((T - T0) / (T1 - T0))
-        return math.sqrt(max(wT, 0.0) / T)
-
-    @staticmethod
-    def linear_volatility(T: float, T0: float, sigma0: float, T1: float, sigma1: float) -> float:
-        """
-        Interpolate linearly in volatility:
-        σ(T) = σ0 + (σ1 - σ0) * ((T - T0) / (T1 - T0))
-
-        Simple and common, but can violate calendar no-arb (w(T) non-monotone) when σ1 << σ0 and T grows.
-        """
-        if not (T0 < T < T1):
-            raise ValueError("Require T in (T0, T1).")
-        return sigma0 + (sigma1 - sigma0) * ((T - T0) / (T1 - T0))
-
-    @staticmethod
-    def linear_log_variance(T: float, T0: float, sigma0: float, T1: float, sigma1: float) -> float:
-        """
-        Interpolate linearly in log total variance:
-        log w(T) = log w0 + (log w1 - log w0) * ((T - T0) / (T1 - T0)), w = σ^2 T
-
-        Smooth and multiplicative; helps avoid negative variances and can temper curvature,
-        but still relies on w0 <= w1 for no-arb within bracket.
-        """
-        if not (T0 < T < T1) or T <= 0 or T0 <= 0 or T1 <= 0:
-            raise ValueError("Require T in (T0, T1) and positive T,T0,T1.")
-        w0, w1 = sigma0 * sigma0 * T0, sigma1 * sigma1 * T1
-        if w0 <= 0 or w1 <= 0:
-            raise ValueError("Total variances must be positive.")
-        lw0, lw1 = math.log(w0), math.log(w1)
-        lwT = lw0 + (lw1 - lw0) * ((T - T0) / (T1 - T0))
-        wT = math.exp(lwT)
-        return math.sqrt(wT / T)
-
-
-# -----------------------------
-# Accuracy discussion helpers
-# -----------------------------
-
-def interpolation_accuracy_notes() -> str:
-    """
-    Returns a compact discussion of interpolation method accuracies.
-    """
-    return (
-        "Accuracy and no-arbitrage considerations:\n"
-        "- Linear in total variance: Typically the most robust for avoiding calendar arbitrage since w(T)=σ^2 T is additive "
-        "over independent increments. If end-node variances are non-decreasing, the interpolated w(T) is non-decreasing inside the bracket. "
-        "It aligns with diffusion scaling and produces sensible short-end behavior.\n"
-        "- Linear in volatility: Intuitive but can break calendar no-arb; σ(T) linear does not guarantee w(T) monotonicity. "
-        "Biases short maturities if σ1 >> σ0 (or vice versa), and may understate tail variance.\n"
-        "- Linear in log variance: Multiplicative smoothing; guards against negative w and reduces sharp kinks. "
-        "Still requires end-node monotonic variances to preserve no-arb. Often yields intermediate shapes between variance-linear and vol-linear.\n"
-        "Practical guidance: Prefer variance-linear for production, enforce w-node monotonicity at calibration, and supplement with explicit "
-        "calendar checks. Where aesthetics matter, log-variance can be a good compromise. Avoid vol-linear unless coupled with post-checks."
-    )
-
-
-# -----------------------------
-# Example usage (for testing)
-# -----------------------------
-
+# ================================
+# Example (intentionally arbitrageous)
+# ================================
 if __name__ == "__main__":
-    # Example quotes and market data for two tenors
-    q_1m = TenorQuote(ATM=0.12, RR25=-0.02, STR25=0.01, RR10=-0.03, STR10=0.015)
-    q_3m = TenorQuote(ATM=0.11, RR25=-0.015, STR25=0.012, RR10=-0.025, STR10=0.016)
+    S = 1.25
+    rd = 0.03
+    rf = 0.01
 
-    mkt_1m = MarketTenor(T=1.0/12.0, F=1.25, DF=0.999)
-    mkt_3m = MarketTenor(T=0.25, F=1.255, DF=0.997)
+    maturities = np.array([0.25, 0.5, 1.0, 2.0])
+    strikes = np.array([0.90, 1.00, 1.05, 1.10, 1.20, 1.30])
 
-    # Build smiles
-    sb_1m = SmileBuilder(q_1m, mkt_1m)
-    sb_3m = SmileBuilder(q_3m, mkt_3m)
+    # Build IV with a local "hump" to force triad convexity failure at the middle strike
+    base = 0.12
+    wing = np.array([+0.02, 0.00, +0.025, 0.00, -0.01, -0.02])  # hump at K=1.05
+    iv_grid = np.vstack([
+        base + 0.018 * wing,
+        base + 0.015 * wing,
+        base + 0.012 * wing,
+        base + 0.010 * wing,
+    ])
 
-    nodes_1m = sb_1m.build_nodes()
-    nodes_3m = sb_3m.build_nodes()
+    res = evaluate_fx_iv_arbitrage_and_plot(iv_grid, maturities, strikes, S, rd, rf, plot=True, tol=1e-12)
 
-    nodes_by_tenor = {"1M": nodes_1m, "3M": nodes_3m}
-    market_by_tenor = {"1M": mkt_1m, "3M": mkt_3m}
-
-    # Arbitrage checks
-    checker = ArbitrageChecker(nodes_by_tenor, market_by_tenor)
-    butterfly_res = checker.check_butterfly()
-    calendar_res = checker.check_calendar()
-
-    print("Butterfly checks:")
-    for tenor, res in butterfly_res.items():
-        print(tenor, res)
-
-    print("\nCalendar checks:")
-    for label, res in calendar_res.items():
-        print(label, res)
-
-    # Interpolation demo between 1M and 3M ATM vols
-    T_mid = 0.125  # 1.5M
-    atm_mid_var_lin = TimeInterpolator.linear_variance(T_mid, mkt_1m.T, q_1m.ATM, mkt_3m.T, q_3m.ATM)
-    atm_mid_vol_lin = TimeInterpolator.linear_volatility(T_mid, mkt_1m.T, q_1m.ATM, mkt_3m.T, q_3m.ATM)
-    atm_mid_logw_lin = TimeInterpolator.linear_log_variance(T_mid, mkt_1m.T, q_1m.ATM, mkt_3m.T, q_3m.ATM)
-    print("\nInterpolated ATM at T=0.125y:")
-    print(f"Variance-linear: {atm_mid_var_lin:.6f}, Vol-linear: {atm_mid_vol_lin:.6f}, Log-variance-linear: {atm_mid_logw_lin:.6f}")
-
-    print("\nNotes:")
-    print(interpolation_accuracy_notes())
+    print("Vertical violations per T:", [float(np.sum(res['vertical_spread_violations_mask'][i])) for i in range(len(maturities))])
+    print("Butterfly violations per T:", [float(np.sum(res['butterfly_violations_mask'][i])) for i in range(len(maturities))])
+    print("Calendar violations per K:", [float(np.sum(res['calendar_violations_mask'][:, j])) for j in range(len(strikes))])
+    print("Bound violations per T:", [float(np.sum(res['bounds_violations_mask'][i])) for i in range(len(maturities))])
